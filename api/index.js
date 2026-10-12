@@ -112,6 +112,7 @@ async function searchWeb(query, timeoutMs) {
 
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = String(process.env.GEMINI_API_KEY || "").trim();
+  console.log("Ключ в Vercel начинается на:", key.substring(0, 5));
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
