@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "google/gemini-1.5-flash:free";
+const DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct:free";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
