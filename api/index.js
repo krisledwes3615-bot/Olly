@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "google/gemma-2-9b-it:free";
+const DEFAULT_MODEL = "llama-3.1-8b-instant";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -105,9 +105,9 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askOpenRouter(text, history, searchContext, timeoutMs) {
-  const key = String(process.env.OPENROUTER_API_KEY || "").trim();
-  if (!key) throw new Error("MISSING_OPENROUTER_KEY");
+async function askGroq(text, history, searchContext, timeoutMs) {
+  const key = String(process.env.GROQ_API_KEY || "").trim();
+  if (!key) throw new Error("MISSING_GROQ_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const messages = [{ role: "system", content: SYSTEM_PROMPT }];
@@ -125,7 +125,7 @@ async function askOpenRouter(text, history, searchContext, timeoutMs) {
   messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    "https://openrouter.ai/api/v1/chat/completions",
+    "https://api.groq.com/openai/v1/chat/completions",
     {
       method: "POST",
       headers: {
@@ -143,18 +143,18 @@ async function askOpenRouter(text, history, searchContext, timeoutMs) {
   );
 
   if (!response.ok) {
-    console.error("OpenRouter Error:", response.status, JSON.stringify(data));
-    throw new Error("OPENROUTER_REQUEST_FAILED");
+    console.error("Groq Error:", response.status, JSON.stringify(data));
+    throw new Error("GROQ_REQUEST_FAILED");
   }
 
   const answer = data?.choices?.[0]?.message?.content?.trim();
-  if (!answer) throw new Error("OPENROUTER_EMPTY_RESPONSE");
+  if (!answer) throw new Error("GROQ_EMPTY_RESPONSE");
   
   return answer;
 }
 
 export default async function handler(req, res) {
-  if (req.method === "GET") return res.status(200).json({ ok: true });
+  if (req.method === "GET") return res.status(200).json({ ok: true, service: "alice-groq-serper" });
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const startedAt = Date.now();
@@ -173,7 +173,7 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askOpenRouter(
+    const answer = await askGroq(
       text,
       oldHistory,
       searchContext,
@@ -189,6 +189,6 @@ export default async function handler(req, res) {
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     console.warn("Alice fallback:", error?.message || "unknown error");
-    return res.status(200).json(aliceResponse("Не получилось связаться с сервером. Попробуйте чуть позже.", false, oldHistory));
+    return res.status(200).json(aliceResponse("Не получилось получить ответ. Проверьте настройки ключа Groq.", false, oldHistory));
   }
 }
