@@ -1,10 +1,10 @@
-const DEFAULT_MODEL = "gemini-flash-latest";
+const DEFAULT_MODEL = "google/gemini-1.5-flash:free";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -69,48 +69,87 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  // Защита от случайных пробелов при копировании ключа
-  const key = String(process.env.GEMINI_API_KEY || "").trim();
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function searchWeb(query, timeoutMs) {
+  const key = process.env.SERPER_API_KEY;
+  if (!key || timeoutMs < 150) return "";
+
+  try {
+    const { response, data } = await fetchJson(
+      "https://google.serper.dev/search",
+      {
+        method: "POST",
+        headers: {
+          "X-API-KEY": key,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+      },
+      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+    );
+
+    if (!response.ok) return "";
+
+    const items = (Array.isArray(data.organic) ? data.organic : [])
+      .slice(0, 3)
+      .map((item, i) => {
+        const title = String(item.title || "").slice(0, 180);
+        const snippet = String(item.snippet || "").slice(0, 350);
+        return `${i + 1}. ${title}: ${snippet}`.trim();
+      });
+
+    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+    return items.length ? items.join("\n") : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+async function askOpenRouter(text, history, searchContext, timeoutMs) {
+  const key = String(process.env.OPENROUTER_API_KEY || "").trim();
+  if (!key) throw new Error("MISSING_OPENROUTER_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  
+  safeHistory(history).forEach(item => {
+    messages.push({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    });
+  });
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  messages.push({ role: "user", content: prompt });
 
-  // Ключ передается прямо в URL, чтобы Google принимал новые AQ-ключи
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${DEFAULT_MODEL}:generateContent?key=${key}`,
+    "https://openrouter.ai/api/v1/chat/completions",
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`
+      },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: { temperature: 0.5, maxOutputTokens: 240 }
+        model: DEFAULT_MODEL,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(LLM_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
-    console.error("Gemini request failed:", response.status, JSON.stringify(data));
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("OpenRouter Error:", response.status, JSON.stringify(data));
+    throw new Error("OPENROUTER_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("").trim();
-
-  if (!answer) throw new Error("GEMINI_EMPTY_RESPONSE");
+  const answer = data?.choices?.[0]?.message?.content?.trim();
+  if (!answer) throw new Error("OPENROUTER_EMPTY_RESPONSE");
+  
   return answer;
 }
 
@@ -125,7 +164,7 @@ export default async function handler(req, res) {
   const oldHistory = safeHistory(body?.state?.session?.history);
 
   if (!text) {
-    return res.status(200).json(aliceResponse("Привет! Что хочешь узнать?", false, oldHistory));
+    return res.status(200).json(aliceResponse("Привет! Я готова ответить на ваши вопросы. Что хотите узнать?", false, oldHistory));
   }
 
   try {
@@ -134,11 +173,22 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(text, oldHistory, searchContext, Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)));
+    const answer = await askOpenRouter(
+      text,
+      oldHistory,
+      searchContext,
+      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
+    );
 
-    const history = [...oldHistory, { role: "user", text }, { role: "model", text: answer }].slice(-MAX_HISTORY_MESSAGES);
+    const history = [
+      ...oldHistory,
+      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+    ].slice(-MAX_HISTORY_MESSAGES);
+
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    return res.status(200).json(aliceResponse("Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.", false, oldHistory));
+    console.warn("Alice fallback:", error?.message || "unknown error");
+    return res.status(200).json(aliceResponse("Не получилось связаться с сервером. Попробуйте чуть позже.", false, oldHistory));
   }
 }
