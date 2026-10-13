@@ -1,10 +1,10 @@
-const DEFAULT_MODEL = "gemini-1.5-flash";
+const DEFAULT_MODEL = "deepseek-chat";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -87,104 +87,87 @@ async function searchWeb(query, timeoutMs) {
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
       .slice(0, 3)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+        return `${i + 1}. ${title}: ${snippet}`.trim();
       });
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = String(process.env.GEMINI_API_KEY || "").trim();
-  console.log("Ключ в Vercel начинается на:", key.substring(0, 5));
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function askDeepSeek(text, history, searchContext, timeoutMs) {
+  const key = String(process.env.DEEPSEEK_API_KEY || "").trim();
+  if (!key) throw new Error("MISSING_DEEPSEEK_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  // Подготавливаем сообщения в формате OpenAI / DeepSeek
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  
+  safeHistory(history).forEach(item => {
+    messages.push({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    });
+  });
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-  {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    "https://api.deepseek.com/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`
+      },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model: DEFAULT_MODEL,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(LLM_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status, JSON.stringify(data));
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("DeepSeek HTTP Error:", status, JSON.stringify(data));
+    if (status === 401 || status === 403) throw new Error("DEEPSEEK_KEY_REJECTED");
+    if (status === 402) throw new Error("DEEPSEEK_NO_BALANCE");
+    throw new Error("DEEPSEEK_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
+  const answer = data?.choices?.[0]?.message?.content?.trim();
+  if (!answer) throw new Error("DEEPSEEK_EMPTY_RESPONSE");
+  
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "MISSING_DEEPSEEK_KEY":
+      return "Сервер пока не настроен. Проверьте переменную DEEPSEEK_API_KEY в Vercel.";
+    case "DEEPSEEK_KEY_REJECTED":
+      return "Ошибка авторизации. Проверьте ключ DeepSeek в настройках Vercel.";
+    case "DEEPSEEK_NO_BALANCE":
+      return "На балансе DeepSeek закончились средства.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+      return "Не успела подготовить ответ. Попробуйте задать вопрос чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
   }
@@ -192,17 +175,10 @@ function errorForUser(error) {
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
+    return res.status(200).json({ ok: true, service: "alice-deepseek-serper" });
   }
 
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
@@ -211,25 +187,20 @@ export default async function handler(req, res) {
   const oldHistory = safeHistory(body?.state?.session?.history);
 
   if (!text) {
-    return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
-      false,
-      oldHistory
-    ));
+    return res.status(200).json(aliceResponse("Привет! Я готова ответить на ваши вопросы. Что хотите узнать?", false, oldHistory));
   }
 
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askDeepSeek(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -241,9 +212,7 @@ export default async function handler(req, res) {
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    console.warn("Alice fallback:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
